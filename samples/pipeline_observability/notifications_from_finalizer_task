@@ -1,0 +1,196 @@
+-- ### How to set up data pipeline notifications using the new Finalizer Task ###
+-- full article: https://medium.com/p/077885531aad 
+
+
+
+--- 1. create a notification integration for sending emails
+create or replace notification integration MY_EMAIL_NOTIFICATION
+  type=email
+  enabled=true
+  allowed_recipients=('<your_email_here>')
+;
+
+show integrations;
+
+grant usage on integration MY_EMAIL_NOTIFICATION to role <YOUR_ROLE>;
+
+
+--- test the integration
+call SYSTEM$SEND_EMAIL(
+  'MY_EMAIL_NOTIFICATION',
+  '<your_email_here>',
+  'Test',
+  'Hello!',
+  'text/html'
+);
+
+    
+--- 2. check the information we want to get  
+select
+  NAME,
+  STATE,
+  RETURN_VALUE,
+  to_varchar(QUERY_START_TIME, 'YYYY-MM-DD HH24:MI:SS') as QUERY_START_TIME,
+  timestampdiff('seconds', QUERY_START_TIME, COMPLETED_TIME) as DURATION_IN_S,
+  ERROR_MESSAGE
+from
+  table(INFORMATION_SCHEMA.TASK_HISTORY(
+    ROOT_TASK_ID => '<your_root_task_id>',
+    SCHEDULED_TIME_RANGE_START => '<your_task_history_timestamp>'::timestamp_ltz,
+    SCHEDULED_TIME_RANGE_END => current_timestamp()
+  ))
+order by
+  SCHEDULED_TIME
+;
+
+
+
+--- 3. create function to get json string from graph run
+create or replace function GET_TASK_GRAPH_RUN_SUMMARY(MY_ROOT_TASK_ID string, MY_START_TIME timestamp_ltz)
+returns string
+as
+$$
+  (select
+      ARRAY_AGG(OBJECT_CONSTRUCT(
+        'TASK_NAME', NAME,
+        'RUN_STATUS', STATE,
+        'RETURN_VALUE', RETURN_VALUE,
+        'STARTED', QUERY_START_TIME,
+        'DURATION', DURATION,
+        'ERROR_MESSAGE', ERROR_MESSAGE
+      )) as GRAPH_RUN_SUMMARY
+  from
+    (select
+        NAME,
+        case when STATE = 'SUCCEEDED' then '🟢 SUCCEEDED'
+             when STATE = 'FAILED' then '🔴 FAILED'
+             when STATE = 'SKIPPED' then '🔵 SKIPPED'
+             when STATE = 'CANCELLED' then '🔘 CANCELLED'
+        end as STATE,
+        RETURN_VALUE,
+        to_varchar(QUERY_START_TIME, 'YYYY-MM-DD HH24:MI:SS') as QUERY_START_TIME,
+        concat(timestampdiff('seconds', QUERY_START_TIME, COMPLETED_TIME), ' s') as DURATION,
+        ERROR_MESSAGE
+    from
+        table(INFORMATION_SCHEMA.TASK_HISTORY(
+              ROOT_TASK_ID => MY_ROOT_TASK_ID ::string,
+              SCHEDULED_TIME_RANGE_START => MY_START_TIME,
+              SCHEDULED_TIME_RANGE_END => current_timestamp()
+      ))
+    order by
+        SCHEDULED_TIME)
+  )::string
+$$
+;
+
+--- test the function with your values from step 1
+select GET_TASK_GRAPH_RUN_SUMMARY(
+    '<your_root_task_id>', 
+    '<your_task_history_timestamp>'
+);
+
+
+--- 4. create function to turn json into html table for our email body
+create or replace function HTML_FROM_JSON_TASK_RUNS(JSON_DATA string)
+returns string
+language python
+runtime_version = '3.8'
+handler = 'GENERATE_HTML_TABLE'
+as
+$$
+import json
+  
+def GENERATE_HTML_TABLE(JSON_DATA):
+    column_widths = ["320px", "120px", "400px", "160px", "80px", "480px"]
+    
+    DATA = json.loads(JSON_DATA)
+    
+    HTML = f"""
+        <img src="https://s26.q4cdn.com/463892824/files/doc_multimedia/HI_RES-_Snowflake_Logo_Blue_1800x550.jpg" alt="Snowflake logo" height="72">
+        <p><strong>Task Graph Run Summary</strong>
+        <br>Log in to Snowsight to see more details.</p>
+        <table border="1" style="border-color:#DEE3EA" cellpadding="5" cellspacing="0">
+            <thead>
+                <tr>
+    """
+    headers = ["Task name", "Run Status", "Return Value", "Started", "Duration", "Error Message"]
+    for i, header in enumerate(headers):
+        HTML += f'<th scope="col" style="text-align:left; width: {column_widths[i]}">{header.capitalize()}</th>'
+    
+    HTML +="""
+        </tr>
+    </thead>
+    <tbody>
+    """
+
+  for ROW_DATA in DATA:
+      HTML += "<tr>"
+      for header in headers:
+          key = header.replace(" ", "_").upper()
+          CELL_DATA = ROW_DATA.get(key, "")
+          HTML += f'<td style="text-align:left; width: {column_widths[headers.index(header)]}">{CELL_DATA}</td>'
+      HTML += "</tr>"
+
+  HTML +="""
+  </tbody>
+  </table>
+  """
+
+  return HTML
+$$
+;
+
+
+      
+
+
+-- suspend the root task to add finalizer
+alter task <YOUR_ROOT_TASK> suspend;
+
+-- create finalizer task
+create or replace task SEND_SUMMARY
+warehouse = '<YOUR_WAREHOUSE>'
+finalize = <YOUR_ROOT_TASK>
+as
+  declare
+    MY_ROOT_TASK_ID string;
+    MY_START_TIME timestamp_ltz;
+    SUMMARY_JSON string;
+    SUMMARY_HTML string;
+  begin
+    -- get root task ID
+    MY_ROOT_TASK_ID := (call SYSTEM$TASK_RUNTIME_INFO('CURRENT_ROOT_TASK_UUID'));
+   
+    -- get root task scheduled time
+    MY_START_TIME := (call SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_ORIGINAL_SCHEDULED_TIMESTAMP'));
+    
+    -- combine all task run infos into one json string
+    SUMMARY_JSON := (select GET_TASK_GRAPH_RUN_SUMMARY(:MY_ROOT_TASK_ID, :MY_START_TIME));
+   
+    -- convert json into html table
+    SUMMARY_HTML := (select HTML_FROM_JSON_TASK_RUNS(:SUMMARY_JSON));
+   
+    -- send html to email
+    call SYSTEM$SEND_EMAIL(
+      'MY_EMAIL_NOTIFICATION',
+      '<your_email_address>',
+      'DAG run summary for <YOUR_ROOT_TASK>',
+      :SUMMARY_HTML,
+      'text/html');
+  
+    -- set return value for finalizer
+    call SYSTEM$SET_RETURN_VALUE('✅ Graph run summary sent to <YOUR_NAME_HERE>.');
+  end;
+;
+
+alter task SEND_SUMMARY resume;
+alter task <YOUR_ROOT_TASK> resume;
+
+
+--- test by running the graph
+execute task <YOUR_ROOT_TASK>;
+
+--- -> wait for the task graph run to complete and check your inbox :) 
+
+
+-- copyright: Jan Sommerfeld, Snowflake Inc.

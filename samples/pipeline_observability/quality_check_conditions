@@ -1,0 +1,4 @@
+--- ##### Task Graph with quality-gate #####
+
+create database if not exists QUALITY_CHECKS;
+use schema QUALITY_CHECKS.PUBLIC;
