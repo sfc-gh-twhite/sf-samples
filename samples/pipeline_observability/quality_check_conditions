@@ -1,4 +1,447 @@
 --- ##### Task Graph with quality-gate #####
 
+
+
+/*
+1. load new buildings and contacts from file
+- create stage
+- landing tables
+- create task 1 to load data
+- creat tast 2 to run system DMFs on landing tables
+- create task 3A to notify about issues
+    - let copy task fail?
+- create task 3B to merge landing table into master tables
+- create task 4 to run system DMFs on master tables
+        - retry task?
+
+2. 
+- create streamlit to see quality metrics
+    - for raw stage
+    - for master table
+
+3. 
+- create UDMFs to check
+- add UDMF to task 2 and task 4
+
+4. 
+- streamlit app to manually edit quality issues in landing table
+
+
+5. 
+- create finalizer task to send task run summary
+    - with data stats
+    - with run stats
+
+6. 
+- wrap into native app
+- share app internally with expert role 
+
+*/
+
+
 create database if not exists QUALITY_CHECKS;
 use schema QUALITY_CHECKS.PUBLIC;
+
+
+--- 1. create internal stage
+create stage if not exists CUSTOMER_INPUT
+comment = 'Portfolio manager provides annual list of buildings and contacts'
+	directory = (enable = TRUE);
+    
+    
+--- 2. create landing tables
+create or replace table BUILDINGS_RAW (
+    BUILDING_ID varchar,
+	BUILDING_TYPE varchar,
+	GROSS_FLOOR_AREA number,
+    AREA_UNIT varchar,
+	CONSTRUCTION date,
+	ADDRESS varchar,
+    PORTFOLIO varchar,
+    CONTACT_ID varchar
+)
+DATA_METRIC_SCHEDULE = 'USING CRON 0 8 * * * UTC'
+;
+
+    
+
+create or replace table CONTACTS_RAW (
+    CONTACT_ID varchar,
+	FIRSTNAME varchar,
+    LASTNAME varchar,
+	EMAIL varchar,
+	PHONE varchar,
+	COMPANY varchar
+)
+DATA_METRIC_SCHEDULE = 'USING CRON 0 8 * * * UTC'
+;
+
+--- 3. create clean tables
+create or replace table BUILDINGS_CLEAN(
+    BUILDING_ID varchar,
+    BUILDING_TYPE varchar,
+    GROSS_FLOOR_AREA number,
+    AREA_UNIT varchar,
+	CONSTRUCTION_YEAR date,
+	ADDRESS varchar,
+    COUNTRY varchar,
+    PORTFOLIO varchar,
+    CONTACT_ID varchar
+)
+DATA_METRIC_SCHEDULE = 'USING CRON 0 8 * * * UTC'
+;
+
+create or replace table CONTACTS_CLEAN (
+    CONTACT_ID varchar,
+	FIRST_NAME varchar,
+    LAST_NAME varchar,
+	EMAIL varchar,
+	PHONE varchar,
+	COMPANY varchar
+)
+DATA_METRIC_SCHEDULE = 'USING CRON 0 8 * * * UTC'
+;
+
+
+create or replace file format DEMO_CSV
+    TYPE=CSV
+    SKIP_HEADER=1
+    FIELD_DELIMITER=','
+    FIELD_OPTIONALLY_ENCLOSED_BY='"'
+    DATE_FORMAT='DD-MM-YYYY'
+    NULL_IF = ('')
+;
+
+
+
+--- create task 1 to load new data   
+create or replace task LOAD_NEW_DATA
+comment = 'loading new files from specified folder'
+config = $${"YEAR_FOLDER": "2023"}$$
+as 
+    declare
+        YEAR_FOLDER varchar := SYSTEM$GET_TASK_GRAPH_CONFIG('YEAR_FOLDER');
+        PATH varchar := '@CUSTOMER_INPUT/'|| YEAR_FOLDER ||'/';
+        BUILDINGS_LOADED varchar;
+        CONTACTS_LOADED varchar;
+    begin
+        delete from BUILDINGS_RAW;
+
+        execute immediate '
+            copy into BUILDINGS_RAW 
+            from '''|| :PATH ||'''
+            files = (''BUILDINGS.csv'')
+            file_format = DEMO_CSV
+            force = true
+            on_error = continue
+        ';
+            
+        BUILDINGS_LOADED := (select $4 from table(RESULT_SCAN(LAST_QUERY_ID()))); 
+
+        
+        delete from CONTACTS_RAW;
+
+        execute immediate '
+            copy into CONTACTS_RAW 
+            from '''|| :PATH ||''' 
+            files = (''CONTACTS.csv'')
+            file_format = DEMO_CSV
+            force = true
+            on_error = continue
+            ';
+
+        CONTACTS_LOADED := (select $4 from table(RESULT_SCAN(LAST_QUERY_ID()))); 
+        
+        call SYSTEM$SET_RETURN_VALUE(:BUILDINGS_LOADED||' buildings and '|| :CONTACTS_LOADED ||' contacts loaded for '||:YEAR_FOLDER);
+    end;
+;
+
+
+
+--- task to call DMFs and load failure into return value 
+create or replace task CHECK_RAW_DATA_QUALITY
+after 
+    LOAD_NEW_DATA
+as 
+    declare
+        c1 CURSOR for 
+            select 
+                case when DMF_SOURCE = 'SYSTEM' then concat('SNOWFLAKE.CORE.', DMF_NAME)            --- getting system DMFs from SNOWFLAKE.CORE
+                     when DMF_SOURCE = 'USER' then concat('QUALITY_TESTS.PUBLIC.', DMF_NAME)        --- getting UDMFs from QUALITY_TESTS.PUBLIC
+                end as DMF_PATH,
+                DMF_NAME,
+                TABLE_NAME, 
+                COLUMN_NAME
+            from 
+                SELECTED_DMFS 
+            where
+                TABLE_NAME = 'BUILDINGS_RAW'
+            ;
+        REC_TEST VARCHAR;
+        REC_TABLE VARCHAR;
+        REC_COLUMN VARCHAR; 
+        TEST_RESULT VARCHAR;
+        RESULTS_SUMMARY VARCHAR default '';
+    begin
+        -- Execute each Test and store the results
+        OPEN c1;
+        FOR rec in c1 DO
+            begin
+                REC_TEST := rec.DMF_PATH;
+                REC_TABLE := rec.TABLE_NAME;
+                REC_COLUMN := rec.COLUMN_NAME;
+                execute immediate 'select '||:REC_TEST||' (select '||:REC_COLUMN||' from '||:REC_TABLE||')';
+
+                TEST_RESULT := (select $1 from table(RESULT_SCAN(LAST_QUERY_ID())));
+                
+                -- Construct the results summary: if check did not pass then add result to the summary
+                if (:TEST_RESULT != 0)
+                    then RESULTS_SUMMARY := :RESULTS_SUMMARY ||' '|| :REC_TEST ||' on '||:REC_COLUMN||' = '||:TEST_RESULT||' |';
+                end if;
+             end;
+        end for;
+        CLOSE c1;
+        
+        if (:RESULTS_SUMMARY = '') 
+            then RESULTS_SUMMARY := 'All checks passed';
+        end if;
+ 
+        call SYSTEM$SET_RETURN_VALUE(:RESULTS_SUMMARY);
+    end;
+;
+
+alter task CHECK_RAW_DATA_QUALITY resume;
+
+
+
+--- optional task to send notification
+create or alter task NOTIFY_ABOUT_QUALITY_ISSUE
+after 
+    CHECK_RAW_DATA_QUALITY
+when 
+    SYSTEM$GET_PREDECESSOR_RETURN_VALUE('CHECK_RAW_DATA_QUALITY') != 'All checks passed'
+as 
+    begin
+        call SYSTEM$SEND_EMAIL(
+          'DEX_SLACK_NOTIFICATION',
+          'waw-dex-notifications-aaaaiwuw472ok7f7ch4oubogu4@snowflake.org.slack.com',
+          'Data Quality Check failed',
+          'Following Data Quality Checks failed: '||SYSTEM$GET_PREDECESSOR_RETURN_VALUE('CHECK_RAW_DATA_QUALITY')
+          );
+    end;
+;
+
+alter task NOTIFY_ABOUT_QUALITY_ISSUE resume;
+
+
+
+--- create task 3 to add the new data
+create or replace task UPDATE_BUILDINGS
+comment = 'merge new buildings into existing dataset'
+after 
+    CHECK_RAW_DATA_QUALITY
+when 
+    SYSTEM$GET_PREDECESSOR_RETURN_VALUE('CHECK_RAW_DATA_QUALITY') = 'All checks passed'
+as
+begin
+    select 1;
+end;
+;
+
+alter task UPDATE_BUILDINGS resume;
+
+
+
+
+
+--- view to show all our DMFS in our "Library"
+create or replace view ALL_DMFS
+comment = 'combining System DMFs with user-defined DMFs'
+as
+select
+    FUNCTION_NAME as DMF_NAME,
+    'USER' as DMF_SOURCE,
+    COMMENT as DESCRIPTION
+from 
+    QUALITY_CHECKS.INFORMATION_SCHEMA.FUNCTIONS 
+where
+    is_data_metric = 'YES' 
+union
+select
+    distinct FUNCTION_NAME as DMF_NAME,
+    'SYSTEM' as DMF_SOURCE,
+    COMMENT as DESCRIPTION
+from
+    SNOWFLAKE.INFORMATION_SCHEMA.FUNCTIONS 
+where
+    is_data_metric = 'YES'
+    and FUNCTION_SCHEMA = 'CORE'
+;
+
+
+
+--- table to hold all quality-checks that we added to tables via Streamlit
+create or replace table SELECTED_DMFS(
+    DMF_NAME varchar,
+    DMF_SOURCE varchar,
+    TABLE_NAME varchar,
+    COLUMN_NAME varchar,
+    PARAMETER varchar
+);
+
+
+
+
+
+
+
+
+
+--- create DMF for validating email format
+create or replace data metric function QUALITY_TESTS.PUBLIC.CHECK_EMAIL_FORMAT(
+  arg_t table(
+    arg_c1 string
+  )
+)
+returns NUMBER
+as
+$$
+  SELECT
+    COUNT(*)
+  FROM 
+    arg_t
+  WHERE
+    arg_c1 is not NULL
+    AND arg_c1 not REGEXP '^[a-zA-Z0-9._-]+@.*.[a-zA-Z]{2,8}$'
+$$
+;
+
+
+
+
+
+--- create DMF for validating phone format
+create or replace data metric function QUALITY_TESTS.PUBLIC.CHECK_PHONE_FORMAT(
+  arg_t table(
+    arg_c1 string
+  )
+)
+returns NUMBER
+as
+$$
+  SELECT
+    COUNT(*)
+  FROM 
+    arg_t
+  WHERE
+    arg_c1 is not NULL
+    AND arg_c1 not REGEXP '^[0-9]+{6,14}$'
+$$
+;
+
+
+
+
+
+
+--- further transformation to be skipped when quality-check of new data fails
+create or replace task TRANSFORMATION
+warehouse = 'DEX_WH'
+after 
+    CHECK_DATA_QUALITY
+when 
+    SYSTEM$GET_PREDECESSOR_RETURN_VALUE('CHECK_DATA_QUALITY') = 'All checks passed'
+as 
+    select '1'
+;
+
+    
+create or replace task MORE_TRANSFORMATION
+warehouse = 'DEX_WH'
+after 
+    TRANSFORMATION
+as 
+    select '1';
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----### setup B with failing task
+
+
+--- task to call quality-check procedures and load failure into return value  -> soon to be calling DMFs 
+create or replace task PIPELINE_CHECKS_B.CHECK_DATA_QUALITY
+warehouse = 'DEX_WH'
+after 
+    PIPELINE_CHECKS_B.LOAD_NEW_DATA
+as 
+    declare
+        c1 CURSOR for 
+            select 
+                TEST_PROC,
+                TARGET_TABLE, 
+                TARGET_COLUMN 
+            from 
+                PUBLIC.ACTIVE_CHECKS 
+            where
+                TARGET_TABLE = 'USER_SIGNUP'
+            ;
+        REC_PROC VARCHAR;
+        REC_TABLE VARCHAR;
+        REC_COLUMN VARCHAR; 
+        TEST_RESULT VARCHAR;
+        RESULTS_SUMMARY VARCHAR default '';
+    begin
+        -- Execute each Test and store the results
+        OPEN c1;
+        FOR rec in c1 DO
+            begin
+                REC_PROC := rec.TEST_PROC;
+                REC_TABLE := rec.TARGET_TABLE;
+                REC_COLUMN := rec.TARGET_COLUMN;
+                execute immediate 'CALL PUBLIC.' ||REC_PROC|| '(\'' ||REC_TABLE|| '\', \'' ||REC_COLUMN|| '\')';
+                
+                TEST_RESULT := (select $1 from table(RESULT_SCAN(LAST_QUERY_ID())));
+                
+                -- Construct the results summary: if check did not pass then add result to the summary
+                if (:TEST_RESULT != 'Passed')
+                    then RESULTS_SUMMARY := :RESULTS_SUMMARY ||' | '|| :TEST_RESULT;
+                end if;
+             end;
+        end for;
+        CLOSE c1;
+        
+        if (:RESULTS_SUMMARY = '') 
+        then 
+            begin
+                RESULTS_SUMMARY := 'All checks passed';
+                call SYSTEM$SET_RETURN_VALUE(:RESULTS_SUMMARY);
+                return :RESULTS_SUMMARY;
+            end;
+        else 
+            begin
+                call SYSTEM$SEND_EMAIL(
+                  'DEX_SLACK_NOTIFICATION',
+                  'waw-dex-notifications-aaaaiwuw472ok7f7ch4oubogu4@snowflake.org.slack.com',
+                  'Data Quality Check failed',
+                  :RESULTS_SUMMARY
+                  );
+            select * from 'Data Quality Check failed';
+            end;
+        end if;
+    end;
+;
+
+
+
+
+
