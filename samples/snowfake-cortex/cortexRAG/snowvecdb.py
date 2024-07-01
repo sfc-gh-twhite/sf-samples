@@ -1,3 +1,5 @@
+from snowflake.snowpark import types as T
+
 # SnowVectorDB Class to generate and store embeddings from a knowledge base in a Snowflake Table. 
 # Experimental, current implementation only supports pdf file processing.
 
@@ -37,15 +39,22 @@ class SnowVectorDB():
             self._register_chunker(chunk_size=self.chunk_size,chunk_overlap=self.chunk_overlap)
     
     def _create_table(self,table_name) -> None:
-    
-        table_creator = f"""create or replace TABLE {table_name} ( 
-            RELATIVE_PATH VARCHAR(16777216), -- Relative path to the PDF file
-            FILE_URL VARCHAR(16777216), -- URL for the PDF
-            SCOPED_FILE_URL VARCHAR(16777216), -- Scoped url (you can choose which one to keep depending on your use case)
-            CHUNK VARCHAR(16777216), -- Piece of text
-            CHUNK_VEC VECTOR(FLOAT, 768) );  -- Embedding using the VECTOR data type"")"""
-        
-        self.client.sql(table_creator).collect()
+        schema = T.StructType(
+            [
+                T.StructField("RELATIVE_PATH", T.StringType()),
+                T.StructField("FILE_URL", T.StringType()),
+                T.StructField("SCOPED_FILE_URL", T.StringType()),
+                T.StructField("CHUNK", T.StringType()),
+                T.StructField("CHUNK_VEC", T.VectorType(float, 768)),
+            ],
+        )
+
+        df = self.client.create_dataframe(
+            [],
+            schema,
+        )
+
+        df.write.save_as_table(table_name, mode="overwrite")            
     
     def _stage_loader(self,source_directory,table_name,stage:str = None) -> None:
 
